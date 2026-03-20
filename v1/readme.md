@@ -1,4 +1,5 @@
-1. FINAL IMPROVED INSTALLER (actools-installer.sh)
+
+🚀 1. FINAL IMPROVED INSTALLER (actools-installer.sh)
 
 Key upgrades I applied (without bloating):
 
@@ -17,6 +18,7 @@ Key upgrades I applied (without bloating):
 ✔ consistent naming: actools everywhere
 
 ✔ minor security hardening
+
 📘 2. ENTERPRISE SINGLE-PAGE DOCUMENTATION
 📄 README.md
 # Actools – Drupal 11 Multi-Environment Installer
