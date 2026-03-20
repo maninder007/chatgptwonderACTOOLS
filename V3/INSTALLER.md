@@ -1,145 +1,301 @@
-Good — now you’re thinking at the right level (tooling, not just scripts).
-
-Let’s turn your Actools Enterprise v3 into a real global CLI tool like ddev.
-
-🧠 Architecture (simple but solid)
-
-We’ll keep it single-script core, but wrap it as a global command:
-
-actools
-├── bin/
-│   └── actools              ← global CLI entry
-├── lib/
-│   └── installer.sh        ← your full v3 script (core engine)
-├── VERSION
-└── install.sh              ← installs CLI globally
-🚀 1. Global CLI Entry (bin/actools)
 #!/usr/bin/env bash
+# =============================================================================
+# Actools Drupal 11 Multi-Environment Installer – Enterprise v3 (Ubuntu 24.04)
+# =============================================================================
 
 set -euo pipefail
 
-ACTOOLS_DIR="/usr/local/lib/actools"
-INSTALLER="$ACTOOLS_DIR/lib/installer.sh"
+# ─── CONFIG PATHS ────────────────────────────────────────────────────────────
+LOG_FILE="$HOME/actools-install.log"
+ENV_FILE="$HOME/actools.env"
+STATE_FILE="$HOME/.actools-state.json"
+LOCK_FILE="/tmp/actools.lock"
 
-if [[ ! -f "$INSTALLER" ]]; then
-  echo "❌ Actools not installed correctly."
-  exit 1
+# ─── LOGGING ─────────────────────────────────────────────────────────────────
+log() { echo "[$1] $(date '+%Y-%m-%d %H:%M:%S') ${*:2}" | tee -a "$LOG_FILE"; }
+info() { log INFO "$@"; }
+warn() { log WARN "$@"; }
+error() { log ERROR "$@"; exit 1; }
+
+# ─── MODES ───────────────────────────────────────────────────────────────────
+MODE="${1:-fresh}"
+[[ "${2:-}" == "--force" ]] && FORCE=true || FORCE=false
+
+info "Actools installer started (mode: $MODE)"
+
+# ─── SECURITY ────────────────────────────────────────────────────────────────
+[[ "$(id -u)" == "0" ]] && error "Do NOT run as root"
+[[ -z "${SUDO_USER:-}" ]] && error "Run with sudo"
+
+if who | grep -q "$(whoami).*(:0|pts/0)"; then
+  error "Password/console login detected. Use SSH key."
 fi
 
-CMD="${1:-help}"
-shift || true
+# Passwordless sudo
+SUDO_LINE="$SUDO_USER ALL=(ALL) NOPASSWD:ALL"
+if ! sudo grep -qxF "$SUDO_LINE" "/etc/sudoers.d/$SUDO_USER" 2>/dev/null; then
+  echo "$SUDO_LINE" | sudo tee "/etc/sudoers.d/$SUDO_USER" >/dev/null
+  sudo chmod 440 "/etc/sudoers.d/$SUDO_USER"
+  info "Enabled passwordless sudo"
+fi
 
-case "$CMD" in
-  install)
-    sudo bash "$INSTALLER" fresh "$@"
-    ;;
-  upgrade)
-    sudo bash "$INSTALLER" upgrade "$@"
-    ;;
-  rerun)
-    sudo bash "$INSTALLER" rerun --force "$@"
-    ;;
-  help|*)
-    echo "Actools CLI"
-    echo ""
-    echo "Usage:"
-    echo "  actools install        Fresh install"
-    echo "  actools upgrade        Upgrade all environments"
-    echo "  actools rerun          Reinstall (with backup)"
-    ;;
-esac
-🧱 2. Move Your Script
+# OS check
+lsb_release -cs | grep -q noble || error "Ubuntu 24.04 required"
 
-Take your Actools Enterprise v3 script and save it as:
+# Lock
+[[ -f "$LOCK_FILE" ]] && error "Another run in progress"
+touch "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
 
-lib/installer.sh
+# ─── PACKAGES ────────────────────────────────────────────────────────────────
+info "Installing base packages..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq curl git unzip zip gnupg lsb-release \
+  build-essential software-properties-common acl vim htop jq
 
-👉 Important:
-Add this at the top:
+# Docker
+if ! command -v docker &>/dev/null; then
+  info "Installing Docker..."
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+    sudo gpg --dearmor -o /usr/share/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" \
+    | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+fi
 
-#!/usr/bin/env bash
-⚙️ 3. Installer for the CLI (install.sh)
+sudo usermod -aG docker "$SUDO_USER" || true
 
-This is what makes it globally available like ddev
+# PHP
+if ! php -v | grep -q "8.4"; then
+  info "Installing PHP 8.4..."
+  sudo add-apt-repository ppa:ondrej/php -y
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq php8.4 php8.4-fpm php8.4-cli php8.4-mysql \
+    php8.4-xml php8.4-mbstring php8.4-curl php8.4-zip php8.4-gd \
+    php8.4-intl php8.4-bcmath php8.4-opcache php8.4-apcu \
+    php8.4-redis php8.4-imagick php8.4-dev
+fi
 
-#!/usr/bin/env bash
+# Composer
+if ! command -v composer &>/dev/null; then
+  info "Installing Composer..."
+  curl -sS https://getcomposer.org/installer -o composer-setup.php
+  php composer-setup.php --install-dir=/usr/local/bin --filename=composer
+  rm composer-setup.php
+fi
 
-set -e
+# Node
+if ! command -v node &>/dev/null; then
+  curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash -
+  sudo apt-get install -y -qq nodejs
+  sudo corepack enable
+fi
 
-echo "🚀 Installing Actools CLI..."
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+[[ -f "$ENV_FILE" ]] || error "Missing $ENV_FILE"
+source "$ENV_FILE"
 
-INSTALL_DIR="/usr/local/lib/actools"
-BIN_PATH="/usr/local/bin/actools"
+: "${BASE_DOMAIN:?Missing BASE_DOMAIN}"
+: "${DRUPAL_ADMIN_EMAIL:?Missing DRUPAL_ADMIN_EMAIL}"
+: "${DB_ROOT_PASS:?Missing DB_ROOT_PASS}"
 
-sudo mkdir -p "$INSTALL_DIR/lib"
-sudo mkdir -p "$INSTALL_DIR/bin"
+# ─── STATE INIT ──────────────────────────────────────────────────────────────
+if [[ ! -f "$STATE_FILE" ]]; then
+  echo '{"installed":false,"environments":{},"db_creds":{}}' > "$STATE_FILE"
+fi
 
-# Copy files
-sudo cp lib/installer.sh "$INSTALL_DIR/lib/"
-sudo cp bin/actools "$INSTALL_DIR/bin/"
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+rand_pass() { openssl rand -base64 18 | tr -dc A-Za-z0-9 | head -c 20; }
 
-# Make executable
-sudo chmod +x "$INSTALL_DIR/lib/installer.sh"
-sudo chmod +x "$INSTALL_DIR/bin/actools"
+get_db_pass() {
+  jq -r ".db_creds.$1.pass // empty" "$STATE_FILE"
+}
 
-# Symlink to global PATH
-sudo ln -sf "$INSTALL_DIR/bin/actools" "$BIN_PATH"
+set_db_pass() {
+  local env="$1" pass="$2"
+  tmp=$(mktemp)
+  jq ".db_creds.$env = {user: \"actools_$env\", pass: \"$pass\"}" "$STATE_FILE" > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
 
-echo "✅ Actools installed globally!"
-echo ""
-echo "Run:"
-echo "  actools help"
-📦 4. Make It Executable
-chmod +x install.sh
-chmod +x bin/actools
-chmod +x lib/installer.sh
-🔥 5. Install It
-./install.sh
-✅ 6. Use It Anywhere
+mark_installed() {
+  tmp=$(mktemp)
+  jq ".environments.$1 = true" "$STATE_FILE" > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
 
-Now from ANY directory:
+is_installed() {
+  jq -e ".environments.$1 == true" "$STATE_FILE" >/dev/null
+}
 
-actools install
-actools upgrade
-actools rerun
-🧠 What You Just Built
+wait_db() {
+  info "Waiting for DB..."
+  for i in {1..30}; do
+    if docker compose exec -T db mysqladmin ping -h localhost --silent; then
+      return
+    fi
+    sleep 2
+  done
+  error "DB not ready"
+}
 
-This is now:
+backup_env() {
+  local env="$1"
+  local dir="/var/www/html/$env"
+  local backup_dir="$HOME/actools_backups/$(date +%F_%H%M%S)/$env"
+  mkdir -p "$backup_dir"
 
-✔ A real CLI tool
-✔ Works globally like ddev, docker, etc.
-✔ Keeps your enterprise installer intact
-✔ Clean separation: CLI vs engine
+  info "Backing up $env"
 
-⚠️ Important Improvements (Next Step)
+  CONTAINER_PHP=$(docker compose ps -q php)
 
-If you want true production-grade tool, next upgrades should be:
+  docker compose exec -T php drush @$env sql-dump --gzip --result-file=/tmp/db.sql.gz || true
+  docker cp "$CONTAINER_PHP":/tmp/db.sql.gz "$backup_dir/database.sql.gz" || true
+  docker compose exec -T php rm -f /tmp/db.sql.gz || true
 
-1. Config per project (VERY important)
+  if docker compose exec -T php test -d "$dir/web/sites/default/files"; then
+    docker compose exec -T php tar -czf /tmp/files.tar.gz -C "$dir/web/sites/default" files
+    docker cp "$CONTAINER_PHP":/tmp/files.tar.gz "$backup_dir/files.tar.gz"
+    docker compose exec -T php rm -f /tmp/files.tar.gz
+  fi
 
-Instead of:
+  find "$HOME/actools_backups" -type d -mtime +7 -exec rm -rf {} +
+}
 
-~/actools.env
+# ─── DOCKER SETUP ────────────────────────────────────────────────────────────
+setup_docker() {
 
-Move to:
+cat > docker-compose.yml <<EOF
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+    restart: unless-stopped
 
-./actools.env   (project-based)
-2. Add commands like:
-actools backup
-actools restore
-actools status
-actools logs
-3. Add auto-update
-actools self-update
-4. Add versioning
-/usr/local/lib/actools/VERSION
-🏁 Final Verdict
+  php:
+    image: drupal:11-php${PHP_VERSION}-fpm
+    volumes:
+      - ./docroot:/var/www/html
 
-You now have:
+  db:
+    image: mariadb:${MARIADB_VERSION}
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
+    volumes:
+      - db_data:/var/lib/mysql
 
-👉 Installer → CLI tool
-👉 Script → Product
-👉 Setup → Platform foundation
+  redis:
+    image: redis:7-alpine
 
-This is no longer a script.
-This is the beginning of a deployment framework.
+volumes:
+  caddy_data:
+  db_data:
+EOF
+
+cat > Caddyfile <<EOF
+${BASE_DOMAIN}, dev.${BASE_DOMAIN}, stg.${BASE_DOMAIN} {
+
+  @dev host dev.${BASE_DOMAIN}
+  @stg host stg.${BASE_DOMAIN}
+  @prod host ${BASE_DOMAIN}
+
+  route @dev { root * /var/www/html/dev/web }
+  route @stg { root * /var/www/html/stg/web }
+  route @prod { root * /var/www/html/prod/web }
+
+  php_fastcgi php:9000
+  file_server
+}
+EOF
+
+docker compose up -d
+wait_db
+}
+
+# ─── INSTALL ENV ─────────────────────────────────────────────────────────────
+install_env() {
+  local env="$1"
+  local db="actools_$env"
+
+  if is_installed "$env"; then
+    info "$env already installed, skipping"
+    return
+  fi
+
+  if [[ "$MODE" == "rerun" && "$FORCE" == true ]]; then
+    backup_env "$env"
+  fi
+
+  local db_pass
+  db_pass=$(get_db_pass "$env")
+
+  if [[ -z "$db_pass" ]]; then
+    db_pass=$(rand_pass)
+    set_db_pass "$env" "$db_pass"
+  fi
+
+  docker compose exec -T db mysql -uroot -p"$DB_ROOT_PASS" -e "
+    CREATE DATABASE IF NOT EXISTS $db;
+    CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$db_pass';
+    GRANT ALL ON $db.* TO '$db'@'%';
+    FLUSH PRIVILEGES;
+  "
+
+  docker compose exec -T php bash -c "
+    mkdir -p /var/www/html/$env
+    cd /var/www/html/$env
+
+    if [ ! -f composer.json ]; then
+      composer create-project drupal/recommended-project:$DRUPAL_VERSION .
+    fi
+
+    composer install --no-dev
+
+    if ! vendor/bin/drush status --field=bootstrap | grep -q Successful; then
+      vendor/bin/drush site:install standard -y \
+        --db-url=mysql://$db:$db_pass@db/$db \
+        --account-mail=$DRUPAL_ADMIN_EMAIL
+    fi
+  "
+
+  mark_installed "$env"
+  info "$env installed"
+}
+
+# ─── HARDENING ───────────────────────────────────────────────────────────────
+harden() {
+  info "Applying permissions..."
+  sudo chown -R www-data:www-data docroot
+  sudo find docroot -type d -exec chmod 755 {} +
+  sudo find docroot -type f -exec chmod 644 {} +
+}
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+main() {
+
+info "===== ACTOOLS INSTALL ====="
+info "Domain: $BASE_DOMAIN"
+info "Mode: $MODE"
+
+read -p "Proceed? [y/N] " -n 1 -r; echo
+[[ $REPLY =~ ^[Yy]$ ]] || exit 0
+
+[[ "$MODE" == "fresh" ]] && setup_docker
+
+for env in dev stg prod; do
+  install_env "$env"
+done
+
+harden
+
+info "Done:"
+info "https://$BASE_DOMAIN"
+info "https://dev.$BASE_DOMAIN"
+info "https://stg.$BASE_DOMAIN"
+}
+
+main "$@"
