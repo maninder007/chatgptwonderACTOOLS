@@ -450,8 +450,8 @@ After setup, verify:
 which actools
 
 Should return:
-
 /usr/local/bin/actools
+
 🔥 Small pro tip (worth doing)
 
 If you plan to evolve this further:
