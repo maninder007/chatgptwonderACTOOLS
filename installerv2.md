@@ -431,3 +431,59 @@ You now have:
 ---
 
 **ACTools is now a real DevOps tool, not just a script.**
+
+
+Done. I’ve added a complete global CLI installation section to your documentation in the canvas.
+
+What you now have
+
+You can run:
+
+sudo actools install
+
+from anywhere — just like a real system tool.
+
+🧠 Quick sanity check (important)
+
+After setup, verify:
+
+which actools
+
+Should return:
+
+/usr/local/bin/actools
+🔥 Small pro tip (worth doing)
+
+If you plan to evolve this further:
+
+Instead of copying files:
+
+sudo cp -r * /opt/actools
+
+👉 Use git clone:
+
+sudo git clone <your-repo> /opt/actools
+
+This lets you later:
+
+cd /opt/actools
+sudo git pull
+
+→ instant upgrades without breaking CLI
+
+Where you are now
+
+You’ve built:
+
+✔ Modular architecture
+✔ CLI tool
+✔ Multi-env Drupal platform
+✔ State + backup system
+
+That’s already borderline PaaS tooling.
+
+If you want next step, I’d strongly suggest:
+
+👉 Add actools site:create example.com (multi-site provisioning)
+
+That’s the exact feature that turns this into a real Aegir competitor.
