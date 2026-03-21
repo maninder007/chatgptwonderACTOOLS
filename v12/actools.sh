@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# Actools Enterprise Installer v3.12
+# Actools Enterprise Installer v3.12 (Ubuntu 24.04)
 # =============================================================================
 
 ACTOOLS_VERSION="3.12"
@@ -56,6 +56,7 @@ SECURITY_PROFILE="${SECURITY_PROFILE:-baseline}"
 PHP_VERSION="${PHP_VERSION:-8.3}"
 MARIADB_VERSION="${MARIADB_VERSION:-11.4}"
 DRUPAL_VERSION="${DRUPAL_VERSION:-11.0}"
+LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-you@domain.com}"
 
 # =============================================================================
 # STATE MANAGEMENT
@@ -87,6 +88,8 @@ apply_security() {
     baseline)
       run "apt-get install -y ufw unattended-upgrades socat curl git unzip zip gnupg jq"
       run "ufw allow OpenSSH"
+      run "ufw allow 80/tcp"
+      run "ufw allow 443/tcp"
       run "ufw --force enable"
       run "dpkg-reconfigure -f noninteractive unattended-upgrades"
       ;;
@@ -108,6 +111,8 @@ apply_security() {
 
 apply_security_baseline() {
   run "ufw allow OpenSSH"
+  run "ufw allow 80/tcp"
+  run "ufw allow 443/tcp"
   run "ufw --force enable"
 }
 
@@ -138,31 +143,38 @@ install_docker() {
 # =============================================================================
 # DOCKER STACK
 # =============================================================================
-setup_stack() {
+generate_caddyfile() {
   CADDYFILE="$REAL_HOME/Caddyfile"
-  [[ -d "$CADDYFILE" ]] && rm -rf "$CADDYFILE"
+  info "Generating Caddyfile at $CADDYFILE"
 
   cat > "$CADDYFILE" <<EOF
-# Dev and Staging - self-signed
-dev.$BASE_DOMAIN, stg.$BASE_DOMAIN {
-    tls internal
-    encode gzip
-    root * /var/www/html/{host}
+# Auto-generated Caddyfile for Actools
+
+dev.${BASE_DOMAIN} {
+    root * /var/www/html/dev
     php_fastcgi php:9000
     file_server
+    tls internal
 }
 
-# Production - Let's Encrypt
-$BASE_DOMAIN {
-    tls $DRUPAL_ADMIN_EMAIL
-    encode gzip
+stg.${BASE_DOMAIN} {
+    root * /var/www/html/stg
+    php_fastcgi php:9000
+    file_server
+    tls internal
+}
+
+${BASE_DOMAIN} {
     root * /var/www/html/prod
     php_fastcgi php:9000
     file_server
-    @http { protocol http }
-    redir @http https://{host}{uri} permanent
+    tls ${LETSENCRYPT_EMAIL}
 }
 EOF
+}
+
+setup_stack() {
+  generate_caddyfile
 
   cat > "$REAL_HOME/docker-compose.yml" <<EOF
 services:
@@ -172,7 +184,6 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
-      - ./docroot:/var/www/html
 
   php:
     image: drupal:11-php${PHP_VERSION}-fpm
@@ -240,44 +251,4 @@ install_env() {
   docker compose exec -T php bash -c "
     dockerize -wait tcp://db:3306 -timeout 60s
     mysql -h db -uroot -p'$DB_ROOT_PASS' -e '
-      CREATE DATABASE IF NOT EXISTS $db;
-      CREATE USER IF NOT EXISTS \"$db\"@\"%\" IDENTIFIED BY \"$pass\";
-      GRANT ALL ON $db.* TO \"$db\"@\"%\";
-      FLUSH PRIVILEGES;
-    '
-  " || warn "DB schema creation may need manual check"
-
-  mark_installed "$env"
-  info "$env installed"
-}
-
-# =============================================================================
-# MAIN
-# =============================================================================
-main() {
-  init_state
-  install_base
-  install_docker
-
-  info "===== PRE-FLIGHT ====="
-  info "User: $REAL_USER"
-  info "Domain: $BASE_DOMAIN"
-  info "Mode: $MODE"
-  info "Security: $SECURITY_PROFILE"
-
-  read -p "Proceed? [y/N] " -n 1 -r; echo
-  [[ $REPLY =~ ^[Yy]$ ]] || exit 0
-
-  apply_security
-  [[ "$MODE" == "fresh" ]] && setup_stack
-
-  for env in dev stg prod; do
-    install_env "$env"
-  done
-
-  info "All done: https://$BASE_DOMAIN"
-  echo
-  echo "Extra tip: For production HTTPS with Let's Encrypt, Caddy automatically requests certs. Dev/stg use self-signed certs."
-}
-
-main "$@"
+      CREATE DATABASE IF
