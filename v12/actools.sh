@@ -143,7 +143,7 @@ setup_stack() {
   [[ -d "$CADDYFILE" ]] && rm -rf "$CADDYFILE"
 
   cat > "$CADDYFILE" <<EOF
-# Dev and Staging - self-signed certs
+# Dev and Staging - self-signed
 dev.$BASE_DOMAIN, stg.$BASE_DOMAIN {
     tls internal
     encode gzip
@@ -152,7 +152,7 @@ dev.$BASE_DOMAIN, stg.$BASE_DOMAIN {
     file_server
 }
 
-# Production - Let’s Encrypt
+# Production - Let's Encrypt
 $BASE_DOMAIN {
     tls $DRUPAL_ADMIN_EMAIL
     encode gzip
@@ -260,4 +260,24 @@ main() {
   install_docker
 
   info "===== PRE-FLIGHT ====="
-  info "User:
+  info "User: $REAL_USER"
+  info "Domain: $BASE_DOMAIN"
+  info "Mode: $MODE"
+  info "Security: $SECURITY_PROFILE"
+
+  read -p "Proceed? [y/N] " -n 1 -r; echo
+  [[ $REPLY =~ ^[Yy]$ ]] || exit 0
+
+  apply_security
+  [[ "$MODE" == "fresh" ]] && setup_stack
+
+  for env in dev stg prod; do
+    install_env "$env"
+  done
+
+  info "All done: https://$BASE_DOMAIN"
+  echo
+  echo "Extra tip: For production HTTPS with Let's Encrypt, Caddy automatically requests certs. Dev/stg use self-signed certs."
+}
+
+main "$@"
