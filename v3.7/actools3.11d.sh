@@ -20,155 +20,114 @@ LOCK_FILE="/tmp/actools.lock"
 LOG_FILE="$REAL_HOME/actools-install.log"
 
 # =============================================================================
-# LOGGING
+# Logging
 # =============================================================================
 log() { echo "[$1] $(date '+%F %T') ${*:2}" | tee -a "$LOG_FILE"; }
 info() { log INFO "$@"; }
 warn() { log WARN "$@"; }
 error() { log ERROR "$@"; exit 1; }
 
-run() {
-  if [[ "$DRY_RUN" == true ]]; then
-    echo "[DRY-RUN] $*"
-  else
-    eval "$@"
-  fi
-}
+run() { [[ "$DRY_RUN" == true ]] && echo "[DRY-RUN] $*" || eval "$@"; }
 
 info "Actools v$ACTOOLS_VERSION started (mode=$MODE)"
 
 # =============================================================================
-# SECURITY CHECKS
+# Security & Environment Checks
 # =============================================================================
 [[ "$(id -u)" -eq 0 ]] || error "Run with sudo"
-[[ -n "${SUDO_USER:-}" ]] || error "Do NOT run as root directly. Use sudo."
-[[ -s "$REAL_HOME/.ssh/authorized_keys" ]] || error "No SSH keys found for user $REAL_USER"
-
-[[ -f "$LOCK_FILE" ]] && error "Another run in progress"
-touch "$LOCK_FILE"
-trap 'rm -f "$LOCK_FILE"' EXIT
-
-lsb_release -cs | grep -q noble || error "Ubuntu 24.04 required"
-
-# =============================================================================
-# LOAD ENV
-# =============================================================================
+[[ -n "${SUDO_USER:-}" ]] || error "Do NOT run as root directly"
+[[ -s "$REAL_HOME/.ssh/authorized_keys" ]] || error "No SSH keys found for $REAL_USER"
 [[ -f "$ENV_FILE" ]] || error "Missing $ENV_FILE"
 source "$ENV_FILE"
 
 : "${BASE_DOMAIN:?Missing BASE_DOMAIN}"
 : "${DRUPAL_ADMIN_EMAIL:?Missing DRUPAL_ADMIN_EMAIL}"
 : "${DB_ROOT_PASS:?Missing DB_ROOT_PASS}"
+
 SECURITY_PROFILE="${SECURITY_PROFILE:-baseline}"
 PHP_VERSION="${PHP_VERSION:-8.2}"
-MARIADB_VERSION="${MARIADB_VERSION:-11.4}"
+MARIADB_VERSION="${MARIADB_VERSION:-11.0}"
 DRUPAL_VERSION="${DRUPAL_VERSION:-11.0}"
 
-# =============================================================================
-# STATE MANAGEMENT
-# =============================================================================
-init_state() {
-  [[ -f "$STATE_FILE" ]] || echo '{"envs":{},"db":{},"security":""}' > "$STATE_FILE"
-  chmod 600 "$STATE_FILE"
-}
+# Lock
+[[ -f "$LOCK_FILE" ]] && error "Another run in progress"
+touch "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
 
-set_state() {
-  local tmp
-  tmp=$(mktemp)
-  jq "$1" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
-}
-
-is_installed() {
-  jq -e ".envs.$1 == true" "$STATE_FILE" >/dev/null 2>&1
-}
-
-mark_installed() {
-  set_state ".envs.$1=true"
-}
-
-get_db_pass() {
-  jq -r ".db.$1.pass // empty" "$STATE_FILE"
-}
-
-set_db_pass() {
-  local env="$1" pass="$2"
-  set_state ".db.$env={\"user\":\"actools_$env\",\"pass\":\"$pass\"}"
-}
-
-rand_pass() {
-  openssl rand -base64 18 | tr -dc A-Za-z0-9 | head -c 20
-}
+# OS check
+lsb_release -cs | grep -q noble || error "Ubuntu 24.04 required"
 
 # =============================================================================
-# SECURITY PROFILES
+# State Management
+# =============================================================================
+init_state() { [[ -f "$STATE_FILE" ]] || echo '{"envs":{},"db":{},"security":""}' > "$STATE_FILE"; chmod 600 "$STATE_FILE"; }
+set_state() { tmp=$(mktemp); jq "$1" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"; }
+is_installed() { jq -e ".envs.$1 == true" "$STATE_FILE" >/dev/null 2>&1; }
+mark_installed() { set_state ".envs.$1=true"; }
+get_db_pass() { jq -r ".db.$1.pass // empty" "$STATE_FILE"; }
+set_db_pass() { local env="$1" pass="$2"; set_state ".db.$env={\"user\":\"actools_$env\",\"pass\":\"$pass\"}"; }
+rand_pass() { openssl rand -base64 18 | tr -dc A-Za-z0-9 | head -c 20; }
+
+# =============================================================================
+# Security Profiles
 # =============================================================================
 apply_security() {
-  info "Applying security profile: $SECURITY_PROFILE"
-  case "$SECURITY_PROFILE" in
-    baseline)
-      run "apt-get install -y ufw unattended-upgrades"
-      run "ufw allow OpenSSH"
-      run "ufw --force enable"
-      run "dpkg-reconfigure -f noninteractive unattended-upgrades"
-      ;;
-    standard)
-      apply_security_baseline
-      run "apt-get install -y auditd"
-      run "systemctl enable auditd"
-      ;;
-    hardened)
-      apply_security_standard
-      run "apt-get install -y aide apparmor apparmor-utils"
-      run "aa-enforce /etc/apparmor.d/* || true"
-      run "aideinit || true"
-      ;;
-    *)
-      error "Unknown SECURITY_PROFILE=$SECURITY_PROFILE"
-      ;;
-  esac
-  set_state ".security=\"$SECURITY_PROFILE\""
+    info "Applying security profile: $SECURITY_PROFILE"
+    case "$SECURITY_PROFILE" in
+        baseline)
+            run "apt-get install -y ufw unattended-upgrades netcat-openbsd"
+            run "ufw allow OpenSSH"
+            run "ufw --force enable"
+            run "dpkg-reconfigure -f noninteractive unattended-upgrades"
+            ;;
+        standard)
+            apply_security_baseline
+            run "apt-get install -y auditd"
+            run "systemctl enable auditd"
+            ;;
+        hardened)
+            apply_security_standard
+            run "apt-get install -y aide apparmor apparmor-utils"
+            run "aa-enforce /etc/apparmor.d/* || true"
+            run "aideinit || true"
+            ;;
+        *)
+            error "Unknown SECURITY_PROFILE=$SECURITY_PROFILE"
+            ;;
+    esac
+    set_state ".security=\"$SECURITY_PROFILE\""
 }
-
-apply_security_baseline() {
-  run "ufw allow OpenSSH"
-  run "ufw --force enable"
-}
-
-apply_security_standard() {
-  apply_security_baseline
-  run "apt-get install -y auditd"
-}
+apply_security_baseline() { run "ufw allow OpenSSH"; run "ufw --force enable"; }
+apply_security_standard() { apply_security_baseline; run "apt-get install -y auditd"; }
 
 # =============================================================================
-# SYSTEM SETUP
+# System Setup
 # =============================================================================
 install_base() {
-  info "Installing base packages"
-  run "apt-get update -qq"
-  run "apt-get install -y -qq curl git unzip zip gnupg jq netcat"
-}
-
-install_docker() {
-  if ! command -v docker &>/dev/null; then
-    info "Installing Docker"
-    run "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg"
-    run "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable\" > /etc/apt/sources.list.d/docker.list"
+    info "Installing base packages"
     run "apt-get update -qq"
-    run "apt-get install -y -qq docker-ce docker-compose-plugin"
-  fi
+    run "apt-get install -y -qq curl git unzip zip gnupg jq netcat-openbsd"
+}
+install_docker() {
+    if ! command -v docker &>/dev/null; then
+        info "Installing Docker"
+        run "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg"
+        run "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable\" > /etc/apt/sources.list.d/docker.list"
+        run "apt-get update -qq"
+        run "apt-get install -y -qq docker-ce docker-compose-plugin"
+    fi
 }
 
 # =============================================================================
-# DOCKER STACK + HTTPS AUTO-GENERATION
+# Docker Stack with HTTPS auto-generation
 # =============================================================================
 setup_stack() {
-  CADDYFILE="$REAL_HOME/Caddyfile"
-  [[ -f "$CADDYFILE" ]] || cat <<EOF > "$CADDYFILE"
-# Auto-generated Caddyfile for Actools (self-signed HTTPS)
-# dev/stg/prod routing
-:443 {
-    tls internal
-    encode gzip
+    CADDYFILE="$REAL_HOME/Caddyfile"
+    [[ -f "$CADDYFILE" ]] || cat <<EOF > "$CADDYFILE"
+# Auto-generated Caddyfile for Actools
+# HTTPS self-signed certs for dev/stg/prod
+{
+    auto_https disable_redirects
 }
 dev.$BASE_DOMAIN {
     root * /var/www/html/dev
@@ -187,8 +146,7 @@ prod.$BASE_DOMAIN {
 }
 EOF
 
-  # docker-compose.yml
-  cat > "$REAL_HOME/docker-compose.yml" <<EOF
+    cat > "$REAL_HOME/docker-compose.yml" <<EOF
 services:
   caddy:
     image: caddy:2.8-alpine
@@ -206,6 +164,11 @@ services:
     image: mariadb:${MARIADB_VERSION}
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "3306"]
+      interval: 2s
+      retries: 30
+      start_period: 2s
     volumes:
       - db_data:/var/lib/mysql
 
@@ -214,95 +177,94 @@ volumes:
   db_data:
 EOF
 
-  cd "$REAL_HOME"
-  docker compose up -d
+    cd "$REAL_HOME"
+    docker compose up -d
 }
 
-# =============================================================================
-# DB READINESS (port-based, idempotent)
-# =============================================================================
 wait_db() {
-  local container port host
-  container=$(docker compose ps -q db)
-  [[ -n "$container" ]] || error "DB container not found"
-
-  port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3306/tcp") 0).HostPort}}' "$container")
-  host="127.0.0.1"
-
-  info "Waiting for DB to be ready at $host:$port..."
-  for i in {1..60}; do
-    if nc -z "$host" "$port"; then
-      info "DB port is open"
-      return
-    fi
-    sleep 2
-  done
-  error "DB not ready after timeout"
+    info "Waiting for DB to be healthy..."
+    local i=0
+    while [[ $i -lt 60 ]]; do
+        if docker inspect --format='{{.State.Health.Status}}' varsix-db-1 2>/dev/null | grep -q healthy; then
+            info "DB is healthy"
+            return
+        fi
+        sleep 2
+        ((i++))
+    done
+    error "DB not healthy after timeout"
 }
 
 # =============================================================================
-# INSTALL ENV
+# Install Environment
 # =============================================================================
 install_env() {
-  local env="$1"
-  local db="actools_$env"
+    local env="$1"
+    local db="actools_$env"
 
-  if is_installed "$env" && [[ "$FORCE" != true ]]; then
-    info "$env already installed — skipping"
-    return
-  fi
+    if is_installed "$env" && [[ "$FORCE" != true ]]; then
+        info "$env already installed — skipping"
+        return
+    fi
 
-  local pass
-  pass=$(get_db_pass "$env")
-  [[ -z "$pass" ]] && pass=$(rand_pass) && set_db_pass "$env" "$pass"
+    local pass
+    pass=$(get_db_pass "$env")
+    [[ -z "$pass" ]] && pass=$(rand_pass) && set_db_pass "$env" "$pass"
 
-  wait_db
+    wait_db
 
-  docker compose exec -T db mysql -uroot -p"$DB_ROOT_PASS" -e "
-    CREATE DATABASE IF NOT EXISTS $db;
-    CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pass';
-    GRANT ALL ON $db.* TO '$db'@'%';
-    FLUSH PRIVILEGES;
-  "
+    docker compose exec -T db mysql -uroot -p"$DB_ROOT_PASS" -e "
+        CREATE DATABASE IF NOT EXISTS $db;
+        CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pass';
+        GRANT ALL ON $db.* TO '$db'@'%';
+        FLUSH PRIVILEGES;
+    "
 
-  docker compose exec -T php bash -c "
-    mkdir -p /var/www/html/$env && cd /var/www/html/$env
-    [ ! -f composer.json ] && composer create-project drupal/recommended-project:$DRUPAL_VERSION .
-    composer install --no-dev
-  "
+    docker compose exec -T php bash -c "
+        mkdir -p /var/www/html/$env && cd /var/www/html/$env
+        [ ! -f composer.json ] && composer create-project drupal/recommended-project:$DRUPAL_VERSION .
+        composer install --no-dev
+    "
 
-  mark_installed "$env"
-  info "$env installed"
+    mark_installed "$env"
+    info "$env installed"
 }
 
 # =============================================================================
-# MAIN
+# Main
 # =============================================================================
 main() {
-  init_state
-  install_base
-  install_docker
+    init_state
+    install_base
+    install_docker
 
-  info "===== PRE-FLIGHT ====="
-  info "User: $REAL_USER"
-  info "Domain: $BASE_DOMAIN"
-  info "Mode: $MODE"
-  info "Security: $SECURITY_PROFILE"
+    info "===== PRE-FLIGHT ====="
+    info "User: $REAL_USER"
+    info "Domain: $BASE_DOMAIN"
+    info "Mode: $MODE"
+    info "Security: $SECURITY_PROFILE"
 
-  read -p "Proceed? [y/N] " -n 1 -r; echo
-  [[ $REPLY =~ ^[Yy]$ ]] || exit 0
+    read -p "Proceed? [y/N] " -n 1 -r; echo
+    [[ $REPLY =~ ^[Yy]$ ]] || exit 0
 
-  apply_security
-  [[ "$MODE" == "fresh" ]] && setup_stack
+    apply_security
+    [[ "$MODE" == "fresh" ]] && setup_stack
 
-  for env in dev stg prod; do
-    install_env "$env"
-  done
+    for env in dev stg prod; do
+        install_env "$env"
+    done
 
-  info "All done: https://$BASE_DOMAIN"
-  echo
-  echo "Extra tip:"
-  echo "If you want real Drupal + HTTPS later, replace the self-signed certs in ./Caddyfile with proper Let’s Encrypt configuration."
+    info "All done: https://$BASE_DOMAIN"
+
+    cat <<TIP
+
+Extra tip:
+- The Caddyfile currently uses self-signed HTTPS for dev/stg/prod.
+- To replace with real Let's Encrypt certs for production later:
+    1. Remove auto-generated Caddyfile.
+    2. Create a new Caddyfile with your domain.
+    3. Use: caddy start --config /path/to/Caddyfile
+TIP
 }
 
 main "$@"
