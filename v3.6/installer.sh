@@ -22,10 +22,10 @@ MODE="${1:-fresh}"
 [[ "${2:-}" == "--force" ]] && FORCE=true || FORCE=false
 DRY_RUN="${DRY_RUN:-false}"
 
-ENV_FILE="$HOME/actools.env"
-STATE_FILE="$HOME/.actools-state.json"
+ENV_FILE="$REAL_HOME/actools.env"
+STATE_FILE="$REAL_HOME/.actools-state.json"
 LOCK_FILE="/tmp/actools.lock"
-LOG_FILE="$HOME/actools-install.log"
+LOG_FILE="$REAL_HOME/actools-install.log"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
