@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =============================================================================
-# Actools Enterprise Installer v3.12 (Ubuntu 24.04)
+# Actools Enterprise Installer v3.13 (Ubuntu 24.04)
 # =============================================================================
 
-ACTOOLS_VERSION="3.12"
+ACTOOLS_VERSION="3.13"
 MODE="${1:-fresh}"
 FORCE=false
 [[ "${2:-}" == "--force" ]] && FORCE=true
@@ -56,7 +56,6 @@ SECURITY_PROFILE="${SECURITY_PROFILE:-baseline}"
 PHP_VERSION="${PHP_VERSION:-8.3}"
 MARIADB_VERSION="${MARIADB_VERSION:-11.4}"
 DRUPAL_VERSION="${DRUPAL_VERSION:-11.0}"
-LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-you@domain.com}"
 
 # =============================================================================
 # STATE MANAGEMENT
@@ -86,10 +85,9 @@ apply_security() {
   info "Applying security profile: $SECURITY_PROFILE"
   case "$SECURITY_PROFILE" in
     baseline)
+      run "apt-get update -qq"
       run "apt-get install -y ufw unattended-upgrades socat curl git unzip zip gnupg jq"
       run "ufw allow OpenSSH"
-      run "ufw allow 80/tcp"
-      run "ufw allow 443/tcp"
       run "ufw --force enable"
       run "dpkg-reconfigure -f noninteractive unattended-upgrades"
       ;;
@@ -111,8 +109,6 @@ apply_security() {
 
 apply_security_baseline() {
   run "ufw allow OpenSSH"
-  run "ufw allow 80/tcp"
-  run "ufw allow 443/tcp"
   run "ufw --force enable"
 }
 
@@ -143,39 +139,42 @@ install_docker() {
 # =============================================================================
 # DOCKER STACK
 # =============================================================================
-generate_caddyfile() {
+setup_stack() {
   CADDYFILE="$REAL_HOME/Caddyfile"
-  info "Generating Caddyfile at $CADDYFILE"
+  [[ -f "$CADDYFILE" ]] && rm -f "$CADDYFILE"
 
-  cat > "$CADDYFILE" <<EOF
+  # Internal CA for dev/stg HTTPS
+  INTERNAL_CA="$REAL_HOME/.actools-internal-ca"
+  mkdir -p "$INTERNAL_CA"
+  if [[ ! -f "$INTERNAL_CA/root.crt" ]]; then
+    info "Generating internal CA for dev/stg HTTPS"
+    docker run --rm -v "$INTERNAL_CA":/certs caddy:2.8-alpine trust root
+  fi
+
+  cat <<EOF > "$CADDYFILE"
 # Auto-generated Caddyfile for Actools
-
-dev.${BASE_DOMAIN} {
-    root * /var/www/html/dev
+(dev|stg).$BASE_DOMAIN {
+    tls internal
+    encode gzip
+    root * /var/www/html/{env}
     php_fastcgi php:9000
     file_server
-    tls internal
 }
 
-stg.${BASE_DOMAIN} {
-    root * /var/www/html/stg
+$BASE_DOMAIN {
+    encode gzip
+    root * /var/www/html
     php_fastcgi php:9000
     file_server
-    tls internal
-}
-
-${BASE_DOMAIN} {
-    root * /var/www/html/prod
-    php_fastcgi php:9000
-    file_server
-    tls ${LETSENCRYPT_EMAIL}
+    tls $DRUPAL_ADMIN_EMAIL
 }
 EOF
-}
 
-setup_stack() {
-  generate_caddyfile
+  # Format and validate Caddyfile
+  docker compose exec -T caddy caddy fmt --overwrite /etc/caddy/Caddyfile || true
+  docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile || true
 
+  # Docker Compose YAML
   cat > "$REAL_HOME/docker-compose.yml" <<EOF
 services:
   caddy:
@@ -184,6 +183,7 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
+      - ./docroot:/var/www/html
 
   php:
     image: drupal:11-php${PHP_VERSION}-fpm
@@ -206,16 +206,23 @@ EOF
 
   cd "$REAL_HOME"
   docker compose up -d
+
+  # Trust the internal CA on host for dev/stg (Linux)
+  if [[ -f "$INTERNAL_CA/root.crt" ]]; then
+    info "Installing internal CA on host to avoid curl -k"
+    sudo cp "$INTERNAL_CA/root.crt" /usr/local/share/ca-certificates/actools-dev.crt
+    sudo update-ca-certificates
+  fi
 }
 
 # =============================================================================
-# DB READINESS (PORT-BASED)
+# DB READINESS
 # =============================================================================
 wait_db() {
   info "Waiting for DB to be ready on port 3306..."
   local retries=30
   for i in $(seq 1 $retries); do
-    if nc -z 127.0.0.1 3306; then
+    if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/3306" &>/dev/null; then
       info "DB is ready"
       return 0
     fi
@@ -251,4 +258,46 @@ install_env() {
   docker compose exec -T php bash -c "
     dockerize -wait tcp://db:3306 -timeout 60s
     mysql -h db -uroot -p'$DB_ROOT_PASS' -e '
-      CREATE DATABASE IF
+      CREATE DATABASE IF NOT EXISTS $db;
+      CREATE USER IF NOT EXISTS \"$db\"@\"%\" IDENTIFIED BY \"$pass\";
+      GRANT ALL ON $db.* TO \"$db\"@\"%\";
+      FLUSH PRIVILEGES;
+    '
+  " || warn "DB schema creation may need manual check"
+
+  mark_installed "$env"
+  info "$env installed"
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+main() {
+  init_state
+  install_base
+  install_docker
+
+  info "===== PRE-FLIGHT ====="
+  info "User: $REAL_USER"
+  info "Domain: $BASE_DOMAIN"
+  info "Mode: $MODE"
+  info "Security: $SECURITY_PROFILE"
+
+  read -p "Proceed? [y/N] " -n 1 -r; echo
+  [[ $REPLY =~ ^[Yy]$ ]] || exit 0
+
+  apply_security
+  [[ "$MODE" == "fresh" ]] && setup_stack
+
+  for env in dev stg prod; do
+    install_env "$env"
+  done
+
+  info "All done: https://$BASE_DOMAIN"
+  echo
+  echo "Tips:"
+  echo "- Dev/stg HTTPS now trusted; curl -I https://dev.$BASE_DOMAIN works"
+  echo "- Production TLS uses Let's Encrypt automatically"
+}
+
+main "$@"
