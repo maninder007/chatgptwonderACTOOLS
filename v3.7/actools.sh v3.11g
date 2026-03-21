@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =============================================================================
-# Actools Enterprise Installer v3.11g (Ubuntu 24.04)
+# Actools Enterprise Installer v3.11h (Ubuntu 24.04)
 # =============================================================================
 
-ACTOOLS_VERSION="3.11g"
+ACTOOLS_VERSION="3.11h"
 MODE="${1:-fresh}"
 FORCE=false
 [[ "${2:-}" == "--force" ]] && FORCE=true
@@ -85,7 +85,7 @@ apply_security() {
   info "Applying security profile: $SECURITY_PROFILE"
   case "$SECURITY_PROFILE" in
     baseline)
-      run "apt-get install -y ufw unattended-upgrades netcat"
+      run "apt-get install -y ufw unattended-upgrades netcat-openbsd || true"
       run "ufw allow OpenSSH"
       run "ufw --force enable"
       run "dpkg-reconfigure -f noninteractive unattended-upgrades"
@@ -122,7 +122,9 @@ apply_security_standard() {
 install_base() {
   info "Installing base packages"
   run "apt-get update -qq"
-  run "apt-get install -y -qq curl git unzip zip gnupg jq netcat"
+
+  NC_PKG="netcat-openbsd"
+  run "apt-get install -y -qq curl git unzip zip gnupg jq $NC_PKG"
 }
 
 install_docker() {
@@ -223,16 +225,6 @@ install_env() {
     [ ! -f composer.json ] && composer create-project drupal/recommended-project:$DRUPAL_VERSION .
     composer install --no-dev
   "
-
-  docker compose exec -T php bash -c "
-    dockerize -wait tcp://db:3306 -timeout 60s
-    mysql -h db -uroot -p'$DB_ROOT_PASS' -e '
-      CREATE DATABASE IF NOT EXISTS $db;
-      CREATE USER IF NOT EXISTS \"$db\"@\"%\" IDENTIFIED BY \"$pass\";
-      GRANT ALL ON $db.* TO \"$db\"@\"%\";
-      FLUSH PRIVILEGES;
-    '
-  " || warn "DB schema creation may need manual check"
 
   mark_installed "$env"
   info "$env installed"
