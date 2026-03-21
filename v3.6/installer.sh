@@ -48,8 +48,14 @@ info "Actools v$ACTOOLS_VERSION started (mode=$MODE)"
 # ─────────────────────────────────────────────────────────────────────────────
 # SECURITY BASELINE (MANDATORY)
 # ─────────────────────────────────────────────────────────────────────────────
-[[ "$(id -u)" == "0" ]] && error "Do NOT run as root"
-[[ -z "${SUDO_USER:-}" ]] && error "Run with sudo"
+# Must be run via sudo, but not as direct root login
+if [[ "$(id -u)" -eq 0 && -z "${SUDO_USER:-}" ]]; then
+  error "Do NOT run as root directly. Use sudo."
+fi
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  error "Run with sudo"
+fi
 
 if ! grep -q "ssh-" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
   error "No SSH keys found. SSH-only access required."
