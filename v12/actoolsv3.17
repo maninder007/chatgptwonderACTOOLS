@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# Actools Enterprise Installer v3.13 (Stable)
+# =============================================================================
+
+ACTOOLS_VERSION="3.13"
+MODE="${1:-fresh}"
+FORCE=false
+[[ "${2:-}" == "--force" ]] && FORCE=true
+
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME="$(eval echo ~$REAL_USER)"
+
+ENV_FILE="$REAL_HOME/actools.env"
+STATE_FILE="$REAL_HOME/.actools-state.json"
+LOCK_FILE="/tmp/actools.lock"
+LOG_FILE="$REAL_HOME/actools-install.log"
+
+log() { echo "[$1] $(date '+%F %T') ${*:2}" | tee -a "$LOG_FILE"; }
+info() { log INFO "$@"; }
+warn() { log WARN "$@"; }
+error() { log ERROR "$@"; exit 1; }
+
+info "Actools v$ACTOOLS_VERSION started (mode=$MODE)"
+
+# =============================================================================
+# SAFETY CHECKS
+# =============================================================================
+[[ "$(id -u)" -eq 0 ]] || error "Run with sudo"
+[[ -n "${SUDO_USER:-}" ]] || error "Use sudo, not root"
+[[ -f "$ENV_FILE" ]] || error "Missing $ENV_FILE"
+
+source "$ENV_FILE"
+
+: "${BASE_DOMAIN:?Missing BASE_DOMAIN}"
+: "${DRUPAL_ADMIN_EMAIL:?Missing DRUPAL_ADMIN_EMAIL}"
+: "${DB_ROOT_PASS:?Missing DB_ROOT_PASS}"
+
+PHP_VERSION="${PHP_VERSION:-8.3}"
+MARIADB_VERSION="${MARIADB_VERSION:-11.4}"
+DRUPAL_VERSION="${DRUPAL_VERSION:-11.0}"
+
+# =============================================================================
+# STATE
+# =============================================================================
+init_state() {
+  [[ -f "$STATE_FILE" ]] || echo '{"envs":{},"db":{}}' > "$STATE_FILE"
+}
+
+set_state() {
+  tmp=$(mktemp)
+  jq "$1" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+is_installed() { jq -e ".envs.$1 == true" "$STATE_FILE" >/dev/null 2>&1; }
+mark_installed() { set_state ".envs.$1=true"; }
+
+rand_pass() { openssl rand -base64 18 | tr -dc A-Za-z0-9 | head -c 20; }
+
+# =============================================================================
+# INSTALL BASE + DOCKER
+# =============================================================================
+install_base() {
+  apt-get update -qq
+  apt-get install -y -qq curl git unzip zip jq
+}
+
+install_docker() {
+  if ! command -v docker &>/dev/null; then
+    info "Installing Docker..."
+    apt-get install -y docker.io docker-compose-plugin
+    usermod -aG docker "$REAL_USER"
+  fi
+}
+
+# =============================================================================
+# STACK SETUP (FIXED)
+# =============================================================================
+setup_stack() {
+  mkdir -p "$REAL_HOME/docroot"
+
+  cat > "$REAL_HOME/Caddyfile" <<EOF
+(common) {
+    encode gzip
+    php_fastcgi php:9000
+    file_server
+}
+
+dev.$BASE_DOMAIN {
+    root * /var/www/html/dev/web
+    import common
+    tls internal
+}
+
+stg.$BASE_DOMAIN {
+    root * /var/www/html/stg/web
+    import common
+    tls internal
+}
+
+$BASE_DOMAIN {
+    root * /var/www/html/prod/web
+    import common
+    tls $DRUPAL_ADMIN_EMAIL
+}
+EOF
+
+  cat > "$REAL_HOME/docker-compose.yml" <<EOF
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./docroot:/var/www/html
+      - caddy_data:/data
+    depends_on:
+      - php
+
+  php:
+    image: drupal:11-php${PHP_VERSION}-fpm
+    volumes:
+      - ./docroot:/var/www/html
+    depends_on:
+      - db
+
+  db:
+    image: mariadb:${MARIADB_VERSION}
+    environment:
+      MARIADB_ROOT_PASSWORD: "${DB_ROOT_PASS}"
+    volumes:
+      - db_data:/var/lib/mysql
+    ports:
+      - "127.0.0.1:3306:3306"
+
+volumes:
+  caddy_data:
+  db_data:
+EOF
+
+  cd "$REAL_HOME"
+  docker compose down --remove-orphans || true
+  docker compose up -d
+}
+
+# =============================================================================
+# WAIT FOR DB
+# =============================================================================
+wait_db() {
+  for i in {1..30}; do
+    if docker compose exec -T db mysqladmin ping -uroot -p"$DB_ROOT_PASS" &>/dev/null; then
+      return
+    fi
+    sleep 2
+  done
+  error "DB not ready"
+}
+
+# =============================================================================
+# INSTALL ENV
+# =============================================================================
+install_env() {
+  env="$1"
+  db="actools_$env"
+  pass=$(rand_pass)
+
+  if is_installed "$env" && [[ "$FORCE" != true ]]; then
+    info "$env exists, skipping"
+    return
+  fi
+
+  wait_db
+
+  info "Installing Drupal ($env)..."
+
+  docker compose exec -T php bash -c "
+    mkdir -p /var/www/html/$env
+    cd /var/www/html/$env
+
+    if [ ! -f composer.json ]; then
+      composer create-project drupal/recommended-project:$DRUPAL_VERSION . --no-interaction
+      composer require drush/drush --no-interaction
+    fi
+  "
+
+  docker compose exec -T php bash -c "
+    apt-get update -qq && apt-get install -y mariadb-client
+
+    mysql -h db -uroot -p'$DB_ROOT_PASS' -e \"
+      CREATE DATABASE IF NOT EXISTS $db;
+      CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pass';
+      GRANT ALL PRIVILEGES ON $db.* TO '$db'@'%';
+      FLUSH PRIVILEGES;
+    \"
+  "
+
+  docker compose exec -T php bash -c "
+    cd /var/www/html/$env
+
+    ./vendor/bin/drush site:install standard \
+      --db-url=mysql://root:$DB_ROOT_PASS@db/$db \
+      --account-name=admin \
+      --account-pass=admin \
+      --account-mail=$DRUPAL_ADMIN_EMAIL \
+      --yes
+  "
+
+  mark_installed "$env"
+  info "$env ready"
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+main() {
+  init_state
+  install_base
+  install_docker
+
+  echo "Domain: $BASE_DOMAIN"
+  read -p "Proceed? [y/N] " -n 1 -r; echo
+  [[ $REPLY =~ ^[Yy]$ ]] || exit 0
+
+  [[ "$MODE" == "fresh" ]] && setup_stack
+
+  for env in dev stg prod; do
+    install_env "$env"
+  done
+
+  echo
+  echo "✅ DONE: https://$BASE_DOMAIN"
+}
+
+main "$@"
