@@ -19,9 +19,6 @@ STATE_FILE="$REAL_HOME/.actools-state.json"
 LOCK_FILE="/tmp/actools.lock"
 LOG_FILE="$REAL_HOME/actools-install.log"
 
-# =============================================================================
-# LOGGING
-# =============================================================================
 log() { echo "[$1] $(date '+%F %T') ${*:2}" | tee -a "$LOG_FILE"; }
 info() { log INFO "$@"; }
 warn() { log WARN "$@"; }
@@ -46,7 +43,9 @@ fi
 if [[ -z "${SUDO_USER:-}" ]]; then
   error "Do NOT run as root directly. Use sudo."
 fi
-[[ -s "$REAL_HOME/.ssh/authorized_keys" ]] || error "No SSH keys found for user $REAL_USER"
+if [[ ! -s "$REAL_HOME/.ssh/authorized_keys" ]]; then
+  error "No SSH keys found for user $REAL_USER"
+fi
 
 [[ -f "$LOCK_FILE" ]] && error "Another run in progress"
 touch "$LOCK_FILE"
@@ -82,13 +81,26 @@ set_state() {
   jq "$1" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
 }
 
-is_installed() { jq -e ".envs.$1 == true" "$STATE_FILE" >/dev/null 2>&1; }
-mark_installed() { set_state ".envs.$1=true"; }
+is_installed() {
+  jq -e ".envs.$1 == true" "$STATE_FILE" >/dev/null 2>&1
+}
 
-get_db_pass() { jq -r ".db.$1.pass // empty" "$STATE_FILE"; }
-set_db_pass() { local env="$1" pass="$2"; set_state ".db.$env={\"user\":\"actools_$env\",\"pass\":\"$pass\"}"; }
+mark_installed() {
+  set_state ".envs.$1=true"
+}
 
-rand_pass() { openssl rand -base64 18 | tr -dc A-Za-z0-9 | head -c 20; }
+get_db_pass() {
+  jq -r ".db.$1.pass // empty" "$STATE_FILE"
+}
+
+set_db_pass() {
+  local env="$1" pass="$2"
+  set_state ".db.$env={\"user\":\"actools_$env\",\"pass\":\"$pass\"}"
+}
+
+rand_pass() {
+  openssl rand -base64 18 | tr -dc A-Za-z0-9 | head -c 20
+}
 
 # =============================================================================
 # SECURITY PROFILES
@@ -120,8 +132,15 @@ apply_security() {
   set_state ".security=\"$SECURITY_PROFILE\""
 }
 
-apply_security_baseline() { run "ufw allow OpenSSH"; run "ufw --force enable"; }
-apply_security_standard() { apply_security_baseline; run "apt-get install -y auditd"; }
+apply_security_baseline() {
+  run "ufw allow OpenSSH"
+  run "ufw --force enable"
+}
+
+apply_security_standard() {
+  apply_security_baseline
+  run "apt-get install -y auditd"
+}
 
 # =============================================================================
 # SYSTEM SETUP
@@ -143,35 +162,24 @@ install_docker() {
 }
 
 # =============================================================================
-# DOCKER STACK WITH HTTPS AUTO-GENERATION
+# DOCKER STACK WITH HTTPS SELF-SIGNED
 # =============================================================================
 setup_stack() {
-  # Ensure Caddyfile exists
+  # Auto-generate Caddyfile with self-signed HTTPS
   CADDYFILE="$REAL_HOME/Caddyfile"
   if [[ -d "$CADDYFILE" ]]; then rm -rf "$CADDYFILE"; fi
   [[ -f "$CADDYFILE" ]] || cat <<EOF > "$CADDYFILE"
-# Auto-generated Caddyfile with self-signed HTTPS
-dev.$BASE_DOMAIN {
-    root * /var/www/html/dev
+# Auto-generated Caddyfile with HTTPS self-signed certs
+(dev.stg.prod).$BASE_DOMAIN {
+    encode gzip
+    root * /var/www/html/{env}
     php_fastcgi php:9000
     file_server
-    tls self_signed
-}
-stg.$BASE_DOMAIN {
-    root * /var/www/html/stg
-    php_fastcgi php:9000
-    file_server
-    tls self_signed
-}
-prod.$BASE_DOMAIN {
-    root * /var/www/html/prod
-    php_fastcgi php:9000
-    file_server
-    tls self_signed
+    tls internal
 }
 EOF
 
-  # Docker-compose.yml
+  # docker-compose.yml
   cat > "$REAL_HOME/docker-compose.yml" <<EOF
 services:
   caddy:
@@ -190,10 +198,8 @@ services:
     image: mariadb:${MARIADB_VERSION}
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 2s
-      retries: 15
+    ports:
+      - "3306:3306"
     volumes:
       - db_data:/var/lib/mysql
 
@@ -207,22 +213,18 @@ EOF
 }
 
 # =============================================================================
-# DB READINESS (idempotent, healthcheck-based)
+# DB READINESS (idempotent, port-based)
 # =============================================================================
 wait_db() {
-  info "Waiting for DB to be healthy..."
+  info "Waiting for DB to be ready on port 3306..."
   for i in {1..30}; do
-    CONTAINER_ID=$(docker compose ps -q db)
-    if [[ -n "$CONTAINER_ID" ]]; then
-      STATUS=$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER_ID")
-      if [[ "$STATUS" == "healthy" ]]; then
-        info "DB is ready"
-        return
-      fi
+    if timeout 1 bash -c "</dev/tcp/127.0.0.1/3306" &>/dev/null; then
+      info "DB is ready"
+      return
     fi
     sleep 2
   done
-  error "DB not healthy after timeout"
+  error "DB not ready after timeout"
 }
 
 # =============================================================================
@@ -286,16 +288,11 @@ main() {
 
   info "All done: https://$BASE_DOMAIN"
 
-  cat <<EOF
-
-Extra tip:
-You are using self-signed HTTPS certs for dev/stg/prod.
-To replace them with real Let’s Encrypt certs later:
-- Update the Caddyfile to remove 'tls self_signed'
-- Ensure ports 80/443 are reachable publicly
-- Caddy will automatically issue and renew Let’s Encrypt certs
-
-EOF
+  echo ""
+  echo "Extra tip:"
+  echo "You can replace the self-signed certs with real Let's Encrypt certificates later by updating the Caddyfile and running:"
+  echo "  docker compose restart caddy"
+  echo "Refer to https://caddyserver.com/docs/automatic-https for guidance."
 }
 
 main "$@"
