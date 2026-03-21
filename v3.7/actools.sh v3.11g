@@ -250,7 +250,6 @@ main() {
   info "Mode: $MODE"
   info "Security: $SECURITY_PROFILE"
 
- 
   read -p "Proceed? [y/N] " -n 1 -r; echo
   [[ $REPLY =~ ^[Yy]$ ]] || exit 0
 
@@ -266,5 +265,4 @@ main() {
   echo "Extra tip: For production HTTPS with Let's Encrypt, replace the auto-generated self-signed certs in ./Caddyfile with proper domains and run 'docker compose up -d'"
 }
 
-# Call main
 main "$@"
