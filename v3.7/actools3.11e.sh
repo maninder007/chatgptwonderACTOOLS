@@ -47,12 +47,18 @@ fi
 if [[ -z "${SUDO_USER:-}" ]]; then
   error "Do NOT run as root directly. Use sudo."
 fi
+
+# SSH key check
 if [[ ! -s "$REAL_HOME/.ssh/authorized_keys" ]]; then
   error "No SSH keys found for user $REAL_USER"
 fi
+
+# Lock
 [[ -f "$LOCK_FILE" ]] && error "Another run in progress"
 touch "$LOCK_FILE"
 trap 'rm -f "$LOCK_FILE"' EXIT
+
+# OS check
 lsb_release -cs | grep -q noble || error "Ubuntu 24.04 required"
 
 # =============================================================================
@@ -60,12 +66,13 @@ lsb_release -cs | grep -q noble || error "Ubuntu 24.04 required"
 # =============================================================================
 [[ -f "$ENV_FILE" ]] || error "Missing $ENV_FILE"
 source "$ENV_FILE"
+
 : "${BASE_DOMAIN:?Missing BASE_DOMAIN}"
 : "${DRUPAL_ADMIN_EMAIL:?Missing DRUPAL_ADMIN_EMAIL}"
 : "${DB_ROOT_PASS:?Missing DB_ROOT_PASS}"
 SECURITY_PROFILE="${SECURITY_PROFILE:-baseline}"
 PHP_VERSION="${PHP_VERSION:-8.2}"
-MARIADB_VERSION="${MARIADB_VERSION:-11.0}"
+MARIADB_VERSION="${MARIADB_VERSION:-11.4}"
 DRUPAL_VERSION="${DRUPAL_VERSION:-11.0}"
 
 # =============================================================================
@@ -75,16 +82,33 @@ init_state() {
   [[ -f "$STATE_FILE" ]] || echo '{"envs":{},"db":{},"security":""}' > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }
+
 set_state() {
   local tmp
   tmp=$(mktemp)
   jq "$1" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
 }
-is_installed() { jq -e ".envs.$1 == true" "$STATE_FILE" >/dev/null 2>&1; }
-mark_installed() { set_state ".envs.$1=true"; }
-get_db_pass() { jq -r ".db.$1.pass // empty" "$STATE_FILE"; }
-set_db_pass() { local env="$1" pass="$2"; set_state ".db.$env={\"user\":\"actools_$env\",\"pass\":\"$pass\"}"; }
-rand_pass() { openssl rand -base64 18 | tr -dc A-Za-z0-9 | head -c 20; }
+
+is_installed() {
+  jq -e ".envs.$1 == true" "$STATE_FILE" >/dev/null 2>&1
+}
+
+mark_installed() {
+  set_state ".envs.$1=true"
+}
+
+get_db_pass() {
+  jq -r ".db.$1.pass // empty" "$STATE_FILE"
+}
+
+set_db_pass() {
+  local env="$1" pass="$2"
+  set_state ".db.$env={\"user\":\"actools_$env\",\"pass\":\"$pass\"}"
+}
+
+rand_pass() {
+  openssl rand -base64 18 | tr -dc A-Za-z0-9 | head -c 20
+}
 
 # =============================================================================
 # SECURITY PROFILES
@@ -115,8 +139,16 @@ apply_security() {
   esac
   set_state ".security=\"$SECURITY_PROFILE\""
 }
-apply_security_baseline() { run "ufw allow OpenSSH"; run "ufw --force enable"; }
-apply_security_standard() { apply_security_baseline; run "apt-get install -y auditd"; }
+
+apply_security_baseline() {
+  run "ufw allow OpenSSH"
+  run "ufw --force enable"
+}
+
+apply_security_standard() {
+  apply_security_baseline
+  run "apt-get install -y auditd"
+}
 
 # =============================================================================
 # SYSTEM SETUP
@@ -124,8 +156,10 @@ apply_security_standard() { apply_security_baseline; run "apt-get install -y aud
 install_base() {
   info "Installing base packages"
   run "apt-get update -qq"
+  # Use 'netcat-openbsd' instead of 'netcat' for Ubuntu 24.04
   run "apt-get install -y -qq curl git unzip zip gnupg jq netcat-openbsd"
 }
+
 install_docker() {
   if ! command -v docker &>/dev/null; then
     info "Installing Docker"
@@ -137,32 +171,25 @@ install_docker() {
 }
 
 # =============================================================================
-# DOCKER STACK WITH HTTPS SELF-SIGNED CERTS
+# DOCKER STACK WITH HTTPS SELF-SIGNED
 # =============================================================================
 setup_stack() {
+  # Ensure Caddyfile exists as a proper file
   CADDYFILE="$REAL_HOME/Caddyfile"
+  if [[ -d "$CADDYFILE" ]]; then
+      rm -rf "$CADDYFILE"
+  fi
   [[ -f "$CADDYFILE" ]] || cat <<EOF > "$CADDYFILE"
-# Auto-generated Caddyfile with self-signed certs
-dev.$BASE_DOMAIN {
-    tls self_signed
-    root * /var/www/html/dev
+# Auto-generated Caddyfile with HTTPS self-signed certs
+(dev.$BASE_DOMAIN, stg.$BASE_DOMAIN, prod.$BASE_DOMAIN) {
+    root * /var/www/html/{host}
     php_fastcgi php:9000
     file_server
-}
-stg.$BASE_DOMAIN {
     tls self_signed
-    root * /var/www/html/stg
-    php_fastcgi php:9000
-    file_server
-}
-prod.$BASE_DOMAIN {
-    tls self_signed
-    root * /var/www/html/prod
-    php_fastcgi php:9000
-    file_server
 }
 EOF
 
+  # docker-compose.yml
   cat > "$REAL_HOME/docker-compose.yml" <<EOF
 services:
   caddy:
@@ -180,11 +207,9 @@ services:
   db:
     image: mariadb:${MARIADB_VERSION}
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASS}
     volumes:
       - db_data:/var/lib/mysql
-    healthcheck:
-      test: ["CMD-SHELL", "exit 0"] # disable internal healthcheck to avoid hanging
 
 volumes:
   caddy_data:
@@ -199,15 +224,17 @@ EOF
 # PORT-BASED DB READINESS
 # =============================================================================
 wait_db() {
-  info "Waiting for DB to be ready (port 3306)..."
-  for i in {1..30}; do
-    if nc -z localhost 3306; then
-      info "DB is ready"
-      return
+  info "Waiting for DB to be ready on port 3306..."
+  local tries=0
+  local max_tries=30
+  while ! nc -z localhost 3306; do
+    tries=$((tries+1))
+    if [[ $tries -ge $max_tries ]]; then
+      error "DB not ready after timeout"
     fi
     sleep 2
   done
-  error "DB not ready after timeout"
+  info "DB is ready"
 }
 
 # =============================================================================
@@ -228,13 +255,12 @@ install_env() {
 
   wait_db
 
-  docker compose exec -T db bash -c "
-    mysql -uroot -p\"$DB_ROOT_PASS\" -e \"
+  docker compose exec -T db mysql -uroot -p"$DB_ROOT_PASS" -e "
     CREATE DATABASE IF NOT EXISTS $db;
     CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pass';
     GRANT ALL ON $db.* TO '$db'@'%';
-    FLUSH PRIVILEGES;\"
-  " || true
+    FLUSH PRIVILEGES;
+  "
 
   docker compose exec -T php bash -c "
     mkdir -p /var/www/html/$env && cd /var/www/html/$env
@@ -271,7 +297,13 @@ main() {
   done
 
   info "All done: https://$BASE_DOMAIN"
-  echo "Extra tip: To replace self-signed certs with real HTTPS, replace the Caddyfile with Let’s Encrypt configuration."
+
+  cat <<TIP
+Extra tip:
+If you want real Drupal + HTTPS routing later, replace the auto-generated Caddyfile with your
+production-ready configuration and Let’s Encrypt certificates. Example:
+dev.example.com { ... tls you@example.com ... }
+TIP
 }
 
 main "$@"
