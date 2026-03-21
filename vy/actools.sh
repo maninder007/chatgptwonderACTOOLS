@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =============================================================================
-# Actools Enterprise Installer v3.7 (Ubuntu 24.04)
+# Actools Enterprise Installer v3.8 (Ubuntu 24.04)
 # =============================================================================
 
-ACTOOLS_VERSION="3.7"
+ACTOOLS_VERSION="3.8"
 MODE="${1:-fresh}"
 FORCE=false
 [[ "${2:-}" == "--force" ]] && FORCE=true
@@ -180,7 +180,6 @@ setup_stack() {
   fi
   [[ -f "$CADDYFILE" ]] || cat <<EOF > "$CADDYFILE"
 # Auto-generated Caddyfile for Actools
-# Development / Staging / Production routing
 dev.$BASE_DOMAIN {
     root * /var/www/html/dev
     php_fastcgi php:9000
@@ -217,6 +216,7 @@ services:
     image: mariadb:${MARIADB_VERSION}
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
+    command: ["--skip-host-cache", "--skip-name-resolve"] 
     volumes:
       - db_data:/var/lib/mysql
 
@@ -230,16 +230,18 @@ EOF
 }
 
 # =============================================================================
-# WAIT FOR DB
+# WAIT FOR DB (idempotent & safe)
 # =============================================================================
 wait_db() {
+  info "Waiting for DB to be ready..."
   for i in {1..30}; do
-    if docker compose exec -T db mysql -uroot -p"$DB_ROOT_PASS" -e "SELECT 1;" &>/dev/null; then
+    if docker compose exec -T db sh -c "mysql -uroot -p\"$DB_ROOT_PASS\" -e 'SELECT 1;' &>/dev/null"; then
+      info "DB is ready"
       return
     fi
     sleep 2
   done
-  error "DB not ready"
+  error "DB not ready after 60s"
 }
 
 # =============================================================================
@@ -260,11 +262,13 @@ install_env() {
 
   wait_db
 
-  docker compose exec -T db mysql -uroot -p"$DB_ROOT_PASS" -e "
-    CREATE DATABASE IF NOT EXISTS $db;
-    CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pass';
-    GRANT ALL ON $db.* TO '$db'@'%';
-    FLUSH PRIVILEGES;
+  docker compose exec -T db sh -c "
+    mysql -uroot -p\"$DB_ROOT_PASS\" -e \"
+      CREATE DATABASE IF NOT EXISTS $db;
+      CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pass';
+      GRANT ALL ON $db.* TO '$db'@'%';
+      FLUSH PRIVILEGES;
+    \"
   "
 
   docker compose exec -T php bash -c "
@@ -302,10 +306,7 @@ main() {
   done
 
   info "All done: https://$BASE_DOMAIN"
-
-  # Extra tip
-  echo -e "\n[Tip] If you want real Drupal + HTTPS routing later, replace the auto-generated Caddyfile with your own Caddyfile, e.g.:"
-  echo "https://caddyserver.com/docs/caddyfile"
+  info "Extra tip: If you want real Drupal + HTTPS routing later, replace the auto Caddyfile with your custom one."
 }
 
 main "$@"
