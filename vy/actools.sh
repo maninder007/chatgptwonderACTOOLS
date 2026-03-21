@@ -229,9 +229,12 @@ EOF
   docker compose up -d
 }
 
+# =============================================================================
+# WAIT FOR DB
+# =============================================================================
 wait_db() {
   for i in {1..30}; do
-    if docker compose exec -T db mysqladmin ping -h localhost --silent; then
+    if docker compose exec -T db mysql -uroot -p"$DB_ROOT_PASS" -e "SELECT 1;" &>/dev/null; then
       return
     fi
     sleep 2
@@ -299,6 +302,10 @@ main() {
   done
 
   info "All done: https://$BASE_DOMAIN"
+
+  # Extra tip
+  echo -e "\n[Tip] If you want real Drupal + HTTPS routing later, replace the auto-generated Caddyfile with your own Caddyfile, e.g.:"
+  echo "https://caddyserver.com/docs/caddyfile"
 }
 
 main "$@"
