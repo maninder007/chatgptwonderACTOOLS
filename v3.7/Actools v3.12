@@ -1,3 +1,6 @@
+please correct any syntax or indemts or white space errors in this script below
+
+
 #!/usr/bin/env bash
 set -euo pipefail
 
