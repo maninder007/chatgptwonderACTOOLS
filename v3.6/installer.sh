@@ -21,7 +21,7 @@ ACTOOLS_VERSION="3.6"
 MODE="${1:-fresh}"
 [[ "${2:-}" == "--force" ]] && FORCE=true || FORCE=false
 DRY_RUN="${DRY_RUN:-false}"
-
+REAL_HOME="$(eval echo ~${SUDO_USER:-$USER})"
 ENV_FILE="$REAL_HOME/actools.env"
 STATE_FILE="$REAL_HOME/.actools-state.json"
 LOCK_FILE="/tmp/actools.lock"
