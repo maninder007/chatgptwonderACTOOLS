@@ -57,7 +57,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   error "Run with sudo"
 fi
 
-if ! grep -q "ssh-" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+if [[ ! -s "$HOME/.ssh/authorized_keys" ]]; then
   error "No SSH keys found. SSH-only access required."
 fi
 
