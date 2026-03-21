@@ -1,6 +1,3 @@
-please correct any syntax or indemts or white space errors in this script below
-
-
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -48,7 +45,6 @@ touch "$LOCK_FILE"
 trap 'rm -f "$LOCK_FILE"' EXIT
 
 lsb_release -cs | grep -q noble || error "Ubuntu 24.04 required"
-
 [[ -f "$ENV_FILE" ]] || error "Missing $ENV_FILE"
 source "$ENV_FILE"
 
@@ -126,7 +122,7 @@ apply_security_standard() {
 install_base() {
   info "Installing base packages"
   run "apt-get update -qq"
-  run "apt-get install -y -qq curl git unzip zip gnupg jq socat"
+  run "apt-get install -y -qq curl git unzip zip gnupg jq socat openssl"
 }
 
 install_docker() {
@@ -146,10 +142,23 @@ setup_stack() {
   CADDYFILE="$REAL_HOME/Caddyfile"
   [[ -f "$CADDYFILE" ]] && rm -f "$CADDYFILE"
 
+  # Generate dev/stg self-signed TLS if missing
+  TLS_DIR="$REAL_HOME/caddy_tls"
+  mkdir -p "$TLS_DIR"
+  for env in dev stg; do
+    if [[ ! -f "$TLS_DIR/$env.crt" || ! -f "$TLS_DIR/$env.key" ]]; then
+      info "Generating internal TLS for $env"
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "$TLS_DIR/$env.key" \
+        -out "$TLS_DIR/$env.crt" \
+        -subj "/CN=$env.$BASE_DOMAIN"
+    fi
+  done
+
   cat <<EOF > "$CADDYFILE"
 # Auto-generated Caddyfile for Actools
 (dev|stg).$BASE_DOMAIN {
-    tls internal
+    tls $TLS_DIR/{env}.crt $TLS_DIR/{env}.key
     encode gzip
     root * /var/www/html/{env}
     php_fastcgi php:9000
@@ -173,6 +182,7 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
+      - $TLS_DIR:/etc/caddy/tls
 
   php:
     image: drupal:11-php${PHP_VERSION}-fpm
@@ -198,7 +208,7 @@ EOF
 }
 
 # =============================================================================
-# DB READINESS (PORT-BASED)
+# DB READINESS
 # =============================================================================
 wait_db() {
   info "Waiting for DB to be ready on port 3306..."
@@ -277,7 +287,7 @@ main() {
 
   info "All done: https://$BASE_DOMAIN"
   echo
-  echo "Extra tip: For production HTTPS with Let's Encrypt, Caddy automatically requests certs. For dev/stg, self-signed certs are used."
+  echo "Extra tip: Production HTTPS is handled automatically by Caddy with Let's Encrypt. Dev/stg uses internal TLS."
 }
 
 main "$@"
