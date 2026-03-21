@@ -2,15 +2,16 @@
 set -euo pipefail
 
 # =============================================================================
-# Actools Enterprise Installer v3.9 (Ubuntu 24.04)
+# Actools Enterprise Installer v3.11 (Ubuntu 24.04)
 # =============================================================================
 
-ACTOOLS_VERSION="3.9"
+ACTOOLS_VERSION="3.11"
 MODE="${1:-fresh}"
 FORCE=false
 [[ "${2:-}" == "--force" ]] && FORCE=true
 DRY_RUN="${DRY_RUN:-false}"
 
+# Real user (important when using sudo)
 REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME="$(eval echo ~$REAL_USER)"
 
@@ -19,6 +20,9 @@ STATE_FILE="$REAL_HOME/.actools-state.json"
 LOCK_FILE="/tmp/actools.lock"
 LOG_FILE="$REAL_HOME/actools-install.log"
 
+# =============================================================================
+# LOGGING
+# =============================================================================
 log() { echo "[$1] $(date '+%F %T') ${*:2}" | tee -a "$LOG_FILE"; }
 info() { log INFO "$@"; }
 warn() { log WARN "$@"; }
@@ -34,31 +38,46 @@ run() {
 
 info "Actools v$ACTOOLS_VERSION started (mode=$MODE)"
 
+# =============================================================================
 # SECURITY CHECKS
-if [[ "$(id -u)" -ne 0 ]]; then error "Run with sudo"; fi
-if [[ -z "${SUDO_USER:-}" ]]; then error "Do NOT run as root directly. Use sudo."; fi
-if [[ ! -s "$REAL_HOME/.ssh/authorized_keys" ]]; then error "No SSH keys found for user $REAL_USER"; fi
+# =============================================================================
+if [[ "$(id -u)" -ne 0 ]]; then
+  error "Run with sudo"
+fi
+if [[ -z "${SUDO_USER:-}" ]]; then
+  error "Do NOT run as root directly. Use sudo."
+fi
 
+# SSH key check
+if [[ ! -s "$REAL_HOME/.ssh/authorized_keys" ]]; then
+  error "No SSH keys found for user $REAL_USER"
+fi
+
+# Lock
 [[ -f "$LOCK_FILE" ]] && error "Another run in progress"
 touch "$LOCK_FILE"
 trap 'rm -f "$LOCK_FILE"' EXIT
 
+# OS check
 lsb_release -cs | grep -q noble || error "Ubuntu 24.04 required"
 
+# =============================================================================
 # LOAD ENV
+# =============================================================================
 [[ -f "$ENV_FILE" ]] || error "Missing $ENV_FILE"
 source "$ENV_FILE"
 
 : "${BASE_DOMAIN:?Missing BASE_DOMAIN}"
 : "${DRUPAL_ADMIN_EMAIL:?Missing DRUPAL_ADMIN_EMAIL}"
 : "${DB_ROOT_PASS:?Missing DB_ROOT_PASS}"
-
 SECURITY_PROFILE="${SECURITY_PROFILE:-baseline}"
 PHP_VERSION="${PHP_VERSION:-8.2}"
 MARIADB_VERSION="${MARIADB_VERSION:-11.0}"
 DRUPAL_VERSION="${DRUPAL_VERSION:-11.0}"
 
+# =============================================================================
 # STATE MANAGEMENT
+# =============================================================================
 init_state() {
   [[ -f "$STATE_FILE" ]] || echo '{"envs":{},"db":{},"security":""}' > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -91,7 +110,9 @@ rand_pass() {
   openssl rand -base64 18 | tr -dc A-Za-z0-9 | head -c 20
 }
 
+# =============================================================================
 # SECURITY PROFILES
+# =============================================================================
 apply_security() {
   info "Applying security profile: $SECURITY_PROFILE"
   case "$SECURITY_PROFILE" in
@@ -129,7 +150,9 @@ apply_security_standard() {
   run "apt-get install -y auditd"
 }
 
+# =============================================================================
 # SYSTEM SETUP
+# =============================================================================
 install_base() {
   info "Installing base packages"
   run "apt-get update -qq"
@@ -146,28 +169,39 @@ install_docker() {
   fi
 }
 
-# DOCKER STACK WITH FIXED CADDY
+# =============================================================================
+# DOCKER STACK WITH HTTPS AUTO-GENERATION
+# =============================================================================
 setup_stack() {
+  # Ensure Caddyfile exists
   CADDYFILE="$REAL_HOME/Caddyfile"
+  if [[ -d "$CADDYFILE" ]]; then
+      rm -rf "$CADDYFILE"
+  fi
+
   [[ -f "$CADDYFILE" ]] || cat <<EOF > "$CADDYFILE"
-# Auto-generated Caddyfile for Actools
+# Auto-generated Caddyfile with self-signed HTTPS for Actools
 dev.$BASE_DOMAIN {
     root * /var/www/html/dev
     php_fastcgi php:9000
     file_server
+    tls internal
 }
 stg.$BASE_DOMAIN {
     root * /var/www/html/stg
     php_fastcgi php:9000
     file_server
+    tls internal
 }
 prod.$BASE_DOMAIN {
     root * /var/www/html/prod
     php_fastcgi php:9000
     file_server
+    tls internal
 }
 EOF
 
+  # Create docker-compose.yml
   cat > "$REAL_HOME/docker-compose.yml" <<EOF
 services:
   caddy:
@@ -186,6 +220,8 @@ services:
     image: mariadb:${MARIADB_VERSION}
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
+    ports:
+      - "3306:3306"
     volumes:
       - db_data:/var/lib/mysql
 
@@ -198,20 +234,21 @@ EOF
   docker compose up -d
 }
 
-# WAIT FOR DB (fixed, no mysqladmin)
 wait_db() {
   info "Waiting for DB to be ready..."
   for i in {1..30}; do
-    if docker compose exec -T db sh -c "mysql -uroot -p\"$DB_ROOT_PASS\" -e 'SELECT 1;' &>/dev/null"; then
+    if nc -z localhost 3306; then
       info "DB is ready"
       return
     fi
     sleep 2
   done
-  error "DB not ready after 60s"
+  error "DB not ready after timeout"
 }
 
+# =============================================================================
 # INSTALL ENV
+# =============================================================================
 install_env() {
   local env="$1"
   local db="actools_$env"
@@ -227,12 +264,13 @@ install_env() {
 
   wait_db
 
-  docker compose exec -T db mysql -uroot -p"$DB_ROOT_PASS" -e "
-    CREATE DATABASE IF NOT EXISTS $db;
-    CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pass';
-    GRANT ALL ON $db.* TO '$db'@'%';
-    FLUSH PRIVILEGES;
-  "
+  docker compose exec -T db sh -c "
+    mysql -uroot -p'$DB_ROOT_PASS' -e \"
+      CREATE DATABASE IF NOT EXISTS $db;
+      CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pass';
+      GRANT ALL ON $db.* TO '$db'@'%';
+      FLUSH PRIVILEGES;\"
+  " || true
 
   docker compose exec -T php bash -c "
     mkdir -p /var/www/html/$env && cd /var/www/html/$env
@@ -244,7 +282,9 @@ install_env() {
   info "$env installed"
 }
 
+# =============================================================================
 # MAIN
+# =============================================================================
 main() {
   init_state
   install_base
@@ -267,7 +307,33 @@ main() {
   done
 
   info "All done: https://$BASE_DOMAIN"
-  info "Extra tip: If you want real Drupal + HTTPS later, you can replace the auto Caddyfile with your own routing"
+
+  # =============================================================================
+  # EXTRA TIP
+  # =============================================================================
+  cat <<EOT
+
+💡 Extra Tip:
+If you want real Drupal + HTTPS routing later, you can replace the auto-generated
+self-signed Caddyfile with a Let's Encrypt setup:
+
+1. Backup your current Caddyfile:
+   cp Caddyfile Caddyfile.bak
+
+2. Replace 'tls internal' with 'tls you@domain.com' in each block:
+   dev.$BASE_DOMAIN {
+       root * /var/www/html/dev
+       php_fastcgi php:9000
+       file_server
+       tls you@domain.com
+   }
+
+3. Reload Caddy:
+   docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+
+This will enable real HTTPS certificates via Let's Encrypt for production.
+
+EOT
 }
 
 main "$@"
