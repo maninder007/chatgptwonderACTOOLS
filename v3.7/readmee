@@ -1,0 +1,14 @@
+Tips for use:
+
+Make sure this file is readable only by your user:
+
+chmod 600 ~/actools.env
+
+Replace #ReplaceWithStrongPassword with a secure random password. Example:
+
+openssl rand -base64 24
+Double-check BASE_DOMAIN and DRUPAL_ADMIN_EMAIL are correct; Caddy uses these for HTTPS.
+
+After saving, run the installer as:
+
+sudo ./actools.sh fresh
